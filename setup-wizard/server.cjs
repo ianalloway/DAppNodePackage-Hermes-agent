@@ -84,6 +84,65 @@ function requestOrigin(req) {
   return `${proto}://${host}`;
 }
 
+// Per-process CSRF token. The wizard page embeds it (see serveIndex) and
+// every state-changing request must echo it back in the X-CSRF-Token header.
+const CSRF_TOKEN = randomBase64Url(32);
+const CSRF_PLACEHOLDER = "__HERMES_CSRF_TOKEN__";
+
+function hostOf(value) {
+  try { return new URL(value).host.toLowerCase(); } catch { return null; }
+}
+
+function allowedHosts(req) {
+  const hosts = new Set();
+  const add = (value) => {
+    const host = String(value || "").trim().toLowerCase();
+    if (host) hosts.add(host);
+  };
+  add(req.headers.host);
+  add(firstHeaderValue(req.headers["x-forwarded-host"]));
+  for (const host of String(process.env.SETUP_WIZARD_ALLOWED_HOSTS || "").split(",")) add(host);
+  return hosts;
+}
+
+function tokensEqual(a, b) {
+  const left = Buffer.from(String(a || ""));
+  const right = Buffer.from(String(b || ""));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+/**
+ * Guard for state-changing requests. Returns null when the request is allowed,
+ * otherwise { status, body } describing the rejection.
+ *
+ * - Content-Type must be application/json, so a cross-site page cannot send a
+ *   "simple" (non-preflighted) request; the preflight then fails because the
+ *   server never returns CORS headers.
+ * - Origin (or Referer when Origin is absent) must point at this host, the
+ *   proxy-forwarded host, or a host in SETUP_WIZARD_ALLOWED_HOSTS.
+ * - X-CSRF-Token must match the token embedded in the wizard page.
+ */
+function checkStateChangingRequest(req) {
+  const contentType = String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+  if (contentType !== "application/json") {
+    return { status: 415, body: { error: "Content-Type must be application/json" } };
+  }
+
+  const hosts = allowedHosts(req);
+  const source = req.headers.origin !== undefined ? req.headers.origin : req.headers.referer;
+  if (source !== undefined) {
+    const host = hostOf(source);
+    if (!host || !hosts.has(host)) {
+      return { status: 403, body: { error: "Cross-origin request rejected" } };
+    }
+  }
+
+  if (!tokensEqual(req.headers["x-csrf-token"], CSRF_TOKEN)) {
+    return { status: 403, body: { error: "Missing or invalid CSRF token. Reload the page and try again.", code: "csrf" } };
+  }
+  return null;
+}
+
 function nexusRedirectUri(req) {
   return process.env.NEXUS_AUTH_REDIRECT_URI || `${requestOrigin(req)}/nexus/auth/callback`;
 }
@@ -448,11 +507,35 @@ function getHermesDoctor() {
   });
 }
 
+function restartContainer() {
+  try {
+    process.kill(1, "SIGTERM");
+  } catch (e) {
+    console.error("Failed to kill PID 1:", e.message);
+    try { process.exit(0); } catch {}
+  }
+}
+
+// Overridable so tests never signal the real PID 1.
+let restartTrigger = restartContainer;
+function setRestartTrigger(fn) {
+  restartTrigger = typeof fn === "function" ? fn : restartContainer;
+}
+
 function handleRequest(req, res) {
   res.setHeader("X-Content-Type-Options", "nosniff");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    const rejection = checkStateChangingRequest(req);
+    if (rejection) {
+      req.resume();
+      json(res, rejection.status, rejection.body);
+      return;
+    }
+  }
 
   // Start Nexus Authgear login.
   if (req.method === "GET" && url.pathname === "/nexus/auth/start") {
@@ -576,8 +659,11 @@ function handleRequest(req, res) {
   // Serve the main HTML
   if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/nexus" || url.pathname === "/nexus/")) {
     try {
-      const html = fs.readFileSync(HTML_FILE, "utf-8");
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      const html = fs.readFileSync(HTML_FILE, "utf-8").split(CSRF_PLACEHOLDER).join(CSRF_TOKEN);
+      res.writeHead(200, {
+        "Cache-Control": "no-store",
+        "Content-Type": "text/html; charset=utf-8",
+      });
       res.end(html);
     } catch {
       res.writeHead(500, { "Content-Type": "text/plain" });
@@ -656,14 +742,7 @@ function handleRequest(req, res) {
   // Restart the package (kills PID 1 — Docker restart policy brings it back)
   if (req.method === "POST" && url.pathname === "/api/restart") {
     json(res, 200, { ok: true, message: "Restart triggered. Container will be back in ~5–10 seconds." });
-    setTimeout(() => {
-      try {
-        process.kill(1, "SIGTERM");
-      } catch (e) {
-        console.error("Failed to kill PID 1:", e.message);
-        try { process.exit(0); } catch {}
-      }
-    }, 250);
+    setTimeout(() => restartTrigger(), 250);
     return;
   }
 
@@ -718,6 +797,7 @@ if (require.main === module) {
 module.exports = {
   createServer,
   handleRequest,
+  setRestartTrigger,
   parseEnvLine,
   parseEnvFile,
   serializeEnv,
