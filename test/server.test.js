@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
+const http = require("node:http");
 
 const serverMod = require("../setup-wizard/server.cjs");
 
@@ -91,6 +92,46 @@ test("serializeEnv preserves comments and updates keys", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test("isAllowedHost accepts DAppNode, loopback and private hosts only", () => {
+  const orig = process.env.SETUP_WIZARD_ALLOWED_HOSTS;
+  delete process.env.SETUP_WIZARD_ALLOWED_HOSTS;
+  try {
+    for (const host of [
+      "hermes-agent.dappnode", "hermes-agent.dappnode:8080", "HERMES-AGENT.DAPPNODE:8080",
+      "my.dappnode", "localhost:8080", "127.0.0.1:8080", "[::1]:8080",
+      "10.20.30.40", "172.16.0.5:8080", "172.31.255.255", "192.168.1.10:8080", "[fd00::1]:8080",
+    ]) {
+      assert.equal(serverMod.isAllowedHost(host), true, host);
+    }
+    for (const host of [
+      undefined, "", "evil.example", "evil.example:8080", "hermes-agent.dappnode.evil.example",
+      "dappnode.evil.example", "8.8.8.8", "172.32.0.1", "192.169.0.1", "[2001:db8::1]",
+      "user@hermes-agent.dappnode", "hermes-agent.dappnode/x",
+    ]) {
+      assert.equal(serverMod.isAllowedHost(host), false, String(host));
+    }
+    process.env.SETUP_WIZARD_ALLOWED_HOSTS = "hermes.example.com, other.example:8443";
+    assert.equal(serverMod.isAllowedHost("hermes.example.com:8080"), true);
+    assert.equal(serverMod.isAllowedHost("other.example:8443"), true);
+    assert.equal(serverMod.isAllowedHost("other.example:9999"), false);
+  } finally {
+    if (orig === undefined) delete process.env.SETUP_WIZARD_ALLOWED_HOSTS;
+    else process.env.SETUP_WIZARD_ALLOWED_HOSTS = orig;
+  }
+});
+
+function rawRequest(port, { method = "GET", path: reqPath = "/", headers = {}, body } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, method, path: reqPath, headers }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString() }));
+    });
+    req.on("error", reject);
+    req.end(body);
+  });
+}
 
 function withTempHermesHome(fn) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-symlink-test-"));
@@ -289,6 +330,42 @@ test("HTTP Server endpoints handle requests", async (t) => {
       body: JSON.stringify({ id: "anything" }),
     });
     assert.equal(res.status, 403);
+  });
+
+  await t.test("DNS-rebinding requests with a foreign Host are refused on every route", async () => {
+    fs.writeFileSync(path.join(tmpDir, ".env"), "OPENAI_API_KEY=sk-rebind-secret\n");
+    const evil = { Host: "rebind.evil.example:8080" };
+    try {
+      const page = await rawRequest(port, { headers: evil });
+      assert.equal(page.status, 421);
+      assert.ok(!page.body.includes(csrfToken), "CSRF token leaked to a foreign Host");
+
+      const config = await rawRequest(port, { path: "/api/config", headers: evil });
+      assert.equal(config.status, 421);
+      assert.doesNotMatch(config.body, /sk-rebind-secret/);
+
+      const post = await rawRequest(port, {
+        method: "POST",
+        path: "/api/config",
+        headers: { ...evil, Origin: "http://rebind.evil.example:8080", "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+        body: configBody,
+      });
+      assert.equal(post.status, 421);
+      assert.equal(fs.existsSync(configPath), false);
+
+      const restart = await rawRequest(port, {
+        method: "POST",
+        path: "/api/restart",
+        headers: { ...evil, Origin: "http://rebind.evil.example:8080", "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+        body: "{}",
+      });
+      assert.equal(restart.status, 421);
+
+      const ok = await rawRequest(port, { path: "/api/config", headers: { Host: "hermes-agent.dappnode:8080" } });
+      assert.equal(ok.status, 200);
+    } finally {
+      fs.rmSync(path.join(tmpDir, ".env"));
+    }
   });
 
   await t.test("POST /api/config accepts a same-origin request with the token", async () => {

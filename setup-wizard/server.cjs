@@ -5,6 +5,7 @@ const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const net = require("node:net");
 const { execFile } = require("node:child_process");
 
 const PORT = Number(process.env.PORT || 8080);
@@ -89,20 +90,55 @@ function requestOrigin(req) {
 const CSRF_TOKEN = randomBase64Url(32);
 const CSRF_PLACEHOLDER = "__HERMES_CSRF_TOKEN__";
 
-function hostOf(value) {
-  try { return new URL(value).host.toLowerCase(); } catch { return null; }
+function parseHost(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw || !/^[a-z0-9.\-_\[\]:]+$/.test(raw)) return null;
+  try {
+    const u = new URL(`http://${raw}`);
+    return { host: u.host, hostname: u.hostname.replace(/^\[|\]$/g, "") };
+  } catch {
+    return null;
+  }
 }
 
-function allowedHosts(req) {
-  const hosts = new Set();
-  const add = (value) => {
-    const host = String(value || "").trim().toLowerCase();
-    if (host) hosts.add(host);
-  };
-  add(req.headers.host);
-  add(firstHeaderValue(req.headers["x-forwarded-host"]));
-  for (const host of String(process.env.SETUP_WIZARD_ALLOWED_HOSTS || "").split(",")) add(host);
-  return hosts;
+function isPrivateIp(hostname) {
+  if (net.isIPv4(hostname)) {
+    const [a, b] = hostname.split(".").map(Number);
+    return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  }
+  if (net.isIPv6(hostname)) {
+    return hostname === "::1" || /^f[cd][0-9a-f]{0,2}:/.test(hostname) || /^fe[89ab][0-9a-f]?:/.test(hostname);
+  }
+  return false;
+}
+
+/**
+ * Allowlist for the Host (and Origin/Referer) header, so a DNS-rebinding page
+ * on an attacker-controlled name cannot talk to the wizard: DAppNode names
+ * (hermes-agent.dappnode, *.dappnode), localhost, loopback/private IP
+ * literals, and anything in SETUP_WIZARD_ALLOWED_HOSTS (comma-separated,
+ * "name" or "name:port"). Any port is accepted.
+ */
+function isAllowedHost(value) {
+  const parsed = parseHost(value);
+  if (!parsed) return false;
+  const { host, hostname } = parsed;
+  if (hostname === "localhost" || hostname === "dappnode" || hostname.endsWith(".dappnode")) return true;
+  if (isPrivateIp(hostname)) return true;
+  const extra = String(process.env.SETUP_WIZARD_ALLOWED_HOSTS || "")
+    .split(",")
+    .map((entry) => parseHost(entry))
+    .filter(Boolean);
+  return extra.some((entry) => entry.host === host || entry.host === hostname);
+}
+
+function originHost(value) {
+  try {
+    const u = new URL(value);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.host : null;
+  } catch {
+    return null;
+  }
 }
 
 function tokensEqual(a, b) {
@@ -118,8 +154,8 @@ function tokensEqual(a, b) {
  * - Content-Type must be application/json, so a cross-site page cannot send a
  *   "simple" (non-preflighted) request; the preflight then fails because the
  *   server never returns CORS headers.
- * - Origin (or Referer when Origin is absent) must point at this host, the
- *   proxy-forwarded host, or a host in SETUP_WIZARD_ALLOWED_HOSTS.
+ * - Origin (or Referer when Origin is absent) must be an allowed host (see
+ *   isAllowedHost); the Host header itself is checked for every request.
  * - X-CSRF-Token must match the token embedded in the wizard page.
  */
 function checkStateChangingRequest(req) {
@@ -128,11 +164,10 @@ function checkStateChangingRequest(req) {
     return { status: 415, body: { error: "Content-Type must be application/json" } };
   }
 
-  const hosts = allowedHosts(req);
   const source = req.headers.origin !== undefined ? req.headers.origin : req.headers.referer;
   if (source !== undefined) {
-    const host = hostOf(source);
-    if (!host || !hosts.has(host)) {
+    const host = originHost(source);
+    if (!host || !isAllowedHost(host)) {
       return { status: 403, body: { error: "Cross-origin request rejected" } };
     }
   }
@@ -578,6 +613,12 @@ function setRestartTrigger(fn) {
 
 function handleRequest(req, res) {
   res.setHeader("X-Content-Type-Options", "nosniff");
+  if (!isAllowedHost(req.headers.host)) {
+    req.resume();
+    res.writeHead(421, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Host not allowed. Open the wizard at http://hermes-agent.dappnode:8080 or add this host to SETUP_WIZARD_ALLOWED_HOSTS.");
+    return;
+  }
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
@@ -850,6 +891,7 @@ module.exports = {
   createServer,
   handleRequest,
   setRestartTrigger,
+  isAllowedHost,
   parseEnvLine,
   parseEnvFile,
   serializeEnv,
