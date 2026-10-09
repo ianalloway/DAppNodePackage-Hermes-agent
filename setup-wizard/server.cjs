@@ -5,6 +5,7 @@ const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const net = require("node:net");
 const { execFile } = require("node:child_process");
 
 const PORT = Number(process.env.PORT || 8080);
@@ -82,6 +83,99 @@ function requestOrigin(req) {
   const proto = forwardedProto === "https" || forwardedProto === "http" ? forwardedProto : "http";
   const host = firstHeaderValue(req.headers["x-forwarded-host"]) || req.headers.host || "hermes-agent.dappnode:8080";
   return `${proto}://${host}`;
+}
+
+// Per-process CSRF token. The wizard page embeds it (see serveIndex) and
+// every state-changing request must echo it back in the X-CSRF-Token header.
+const CSRF_TOKEN = randomBase64Url(32);
+const CSRF_PLACEHOLDER = "__HERMES_CSRF_TOKEN__";
+
+function parseHost(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw || !/^[a-z0-9.\-_\[\]:]+$/.test(raw)) return null;
+  try {
+    const u = new URL(`http://${raw}`);
+    return { host: u.host, hostname: u.hostname.replace(/^\[|\]$/g, "") };
+  } catch {
+    return null;
+  }
+}
+
+function isPrivateIp(hostname) {
+  if (net.isIPv4(hostname)) {
+    const [a, b] = hostname.split(".").map(Number);
+    return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  }
+  if (net.isIPv6(hostname)) {
+    return hostname === "::1" || /^f[cd][0-9a-f]{0,2}:/.test(hostname) || /^fe[89ab][0-9a-f]?:/.test(hostname);
+  }
+  return false;
+}
+
+/**
+ * Allowlist for the Host (and Origin/Referer) header, so a DNS-rebinding page
+ * on an attacker-controlled name cannot talk to the wizard: DAppNode names
+ * (hermes-agent.dappnode, *.dappnode), localhost, loopback/private IP
+ * literals, and anything in SETUP_WIZARD_ALLOWED_HOSTS (comma-separated,
+ * "name" or "name:port"). Any port is accepted.
+ */
+function isAllowedHost(value) {
+  const parsed = parseHost(value);
+  if (!parsed) return false;
+  const { host, hostname } = parsed;
+  if (hostname === "localhost" || hostname === "dappnode" || hostname.endsWith(".dappnode")) return true;
+  if (isPrivateIp(hostname)) return true;
+  const extra = String(process.env.SETUP_WIZARD_ALLOWED_HOSTS || "")
+    .split(",")
+    .map((entry) => parseHost(entry))
+    .filter(Boolean);
+  return extra.some((entry) => entry.host === host || entry.host === hostname);
+}
+
+function originHost(value) {
+  try {
+    const u = new URL(value);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.host : null;
+  } catch {
+    return null;
+  }
+}
+
+function tokensEqual(a, b) {
+  const left = Buffer.from(String(a || ""));
+  const right = Buffer.from(String(b || ""));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+/**
+ * Guard for state-changing requests. Returns null when the request is allowed,
+ * otherwise { status, body } describing the rejection.
+ *
+ * - Content-Type must be application/json, so a cross-site page cannot send a
+ *   "simple" (non-preflighted) request; the preflight then fails because the
+ *   server never returns CORS headers.
+ * - Origin (or Referer when Origin is absent) must be an allowed host (see
+ *   isAllowedHost); the Host header itself is checked for every request.
+ * - X-CSRF-Token must match the token embedded in the wizard page.
+ */
+function checkStateChangingRequest(req) {
+  const contentType = String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+  if (contentType !== "application/json") {
+    return { status: 415, body: { error: "Content-Type must be application/json" } };
+  }
+
+  const source = req.headers.origin !== undefined ? req.headers.origin : req.headers.referer;
+  if (source !== undefined) {
+    const host = originHost(source);
+    if (!host || !isAllowedHost(host)) {
+      return { status: 403, body: { error: "Cross-origin request rejected" } };
+    }
+  }
+
+  if (!tokensEqual(req.headers["x-csrf-token"], CSRF_TOKEN)) {
+    return { status: 403, body: { error: "Missing or invalid CSRF token. Reload the page and try again.", code: "csrf" } };
+  }
+  return null;
 }
 
 function nexusRedirectUri(req) {
@@ -163,6 +257,60 @@ async function createNexusApiKey(accessToken) {
   return data.raw_key;
 }
 
+// HERMES_HOME is writable by the unprivileged hermes user while this server
+// runs as root, so never follow a symlink (or block on a FIFO) planted there.
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+const O_NONBLOCK = fs.constants.O_NONBLOCK || 0;
+
+function readRegularFile(filePath) {
+  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`${path.basename(filePath)} is not a regular file`);
+    return fs.readFileSync(fd, "utf-8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Atomically replace filePath without following symlinks: refuse if the
+ * target exists and is not a regular file, write a fresh O_EXCL|O_NOFOLLOW
+ * temp file in the same directory, fchmod/fchown it and rename it over the
+ * target. When running as root the file is owned by the directory's owner
+ * (the hermes user), matching what the hermes-run cont-init hooks expect.
+ */
+function writeFileSafely(filePath, content, mode) {
+  const dir = path.dirname(filePath);
+  let existing = null;
+  try {
+    existing = fs.lstatSync(filePath);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  if (existing && !existing.isFile()) {
+    throw new Error(`Refusing to write ${path.basename(filePath)}: not a regular file`);
+  }
+
+  const owner = fs.statSync(dir);
+  const tmpPath = path.join(dir, `.${path.basename(filePath)}.${crypto.randomBytes(8).toString("hex")}.tmp`);
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW;
+  const fd = fs.openSync(tmpPath, flags, 0o600);
+  try {
+    try {
+      fs.writeFileSync(fd, content, "utf-8");
+      if (process.getuid && process.getuid() === 0) fs.fchownSync(fd, owner.uid, owner.gid);
+      fs.fchmodSync(fd, mode);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmpPath); } catch {}
+    throw err;
+  }
+}
+
 function parseEnvLine(line) {
   let trimmed = line.trim();
   if (!trimmed || trimmed.startsWith("#")) return [null, null];
@@ -196,7 +344,7 @@ function serializeEnv(env) {
   const envFile = getEnvFile();
   let lines = [];
   try {
-    const existing = fs.readFileSync(envFile, "utf-8");
+    const existing = readRegularFile(envFile);
     const existingLines = existing.split("\n");
     const written = new Set();
     for (const line of existingLines) {
@@ -218,12 +366,12 @@ function serializeEnv(env) {
 }
 
 function readConfig() {
-  try { return { raw: fs.readFileSync(getConfigFile(), "utf-8") }; }
+  try { return { raw: readRegularFile(getConfigFile()) }; }
   catch { return { raw: "" }; }
 }
 
 function readEnv() {
-  try { return parseEnvFile(fs.readFileSync(getEnvFile(), "utf-8")); }
+  try { return parseEnvFile(readRegularFile(getEnvFile())); }
   catch { return {}; }
 }
 
@@ -241,7 +389,7 @@ function readDashboardCredentials() {
 
   try {
     const values = {};
-    const content = fs.readFileSync(getDashboardLoginFile(), "utf-8");
+    const content = readRegularFile(getDashboardLoginFile());
     for (const line of content.split("\n")) {
       const colon = line.indexOf(":");
       if (colon < 1) continue;
@@ -448,11 +596,41 @@ function getHermesDoctor() {
   });
 }
 
+function restartContainer() {
+  try {
+    process.kill(1, "SIGTERM");
+  } catch (e) {
+    console.error("Failed to kill PID 1:", e.message);
+    try { process.exit(0); } catch {}
+  }
+}
+
+// Overridable so tests never signal the real PID 1.
+let restartTrigger = restartContainer;
+function setRestartTrigger(fn) {
+  restartTrigger = typeof fn === "function" ? fn : restartContainer;
+}
+
 function handleRequest(req, res) {
   res.setHeader("X-Content-Type-Options", "nosniff");
+  if (!isAllowedHost(req.headers.host)) {
+    req.resume();
+    res.writeHead(421, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Host not allowed. Open the wizard at http://hermes-agent.dappnode:8080 or add this host to SETUP_WIZARD_ALLOWED_HOSTS.");
+    return;
+  }
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    const rejection = checkStateChangingRequest(req);
+    if (rejection) {
+      req.resume();
+      json(res, rejection.status, rejection.body);
+      return;
+    }
+  }
 
   // Start Nexus Authgear login.
   if (req.method === "GET" && url.pathname === "/nexus/auth/start") {
@@ -576,8 +754,11 @@ function handleRequest(req, res) {
   // Serve the main HTML
   if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/nexus" || url.pathname === "/nexus/")) {
     try {
-      const html = fs.readFileSync(HTML_FILE, "utf-8");
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      const html = fs.readFileSync(HTML_FILE, "utf-8").split(CSRF_PLACEHOLDER).join(CSRF_TOKEN);
+      res.writeHead(200, {
+        "Cache-Control": "no-store",
+        "Content-Type": "text/html; charset=utf-8",
+      });
       res.end(html);
     } catch {
       res.writeHead(500, { "Content-Type": "text/plain" });
@@ -633,13 +814,11 @@ function handleRequest(req, res) {
           }
           const merged = Object.assign(currentEnv, incoming.env);
           fs.mkdirSync(hermesHome, { recursive: true });
-          fs.writeFileSync(envFile, serializeEnv(merged), { encoding: "utf-8", mode: 0o600 });
-          try { fs.chmodSync(envFile, 0o600); } catch {}
+          writeFileSafely(envFile, serializeEnv(merged), 0o600);
         }
         if (incoming.configYaml && typeof incoming.configYaml === "string") {
           fs.mkdirSync(hermesHome, { recursive: true });
-          fs.writeFileSync(configFile, incoming.configYaml, { encoding: "utf-8", mode: 0o644 });
-          try { fs.chmodSync(configFile, 0o644); } catch {}
+          writeFileSafely(configFile, incoming.configYaml, 0o644);
         }
         json(res, 200, { ok: true });
       })
@@ -656,14 +835,7 @@ function handleRequest(req, res) {
   // Restart the package (kills PID 1 — Docker restart policy brings it back)
   if (req.method === "POST" && url.pathname === "/api/restart") {
     json(res, 200, { ok: true, message: "Restart triggered. Container will be back in ~5–10 seconds." });
-    setTimeout(() => {
-      try {
-        process.kill(1, "SIGTERM");
-      } catch (e) {
-        console.error("Failed to kill PID 1:", e.message);
-        try { process.exit(0); } catch {}
-      }
-    }, 250);
+    setTimeout(() => restartTrigger(), 250);
     return;
   }
 
@@ -718,9 +890,12 @@ if (require.main === module) {
 module.exports = {
   createServer,
   handleRequest,
+  setRestartTrigger,
+  isAllowedHost,
   parseEnvLine,
   parseEnvFile,
   serializeEnv,
+  writeFileSafely,
   readConfig,
   readEnv,
   readDashboardCredentials,

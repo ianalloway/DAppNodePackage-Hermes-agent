@@ -4,6 +4,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="hermes-csrf-token" content="__HERMES_CSRF_TOKEN__">
   <title>Hermes Agent — DAppNode</title>
   <style>
     :root {
@@ -907,6 +908,37 @@
   </div>
 
   <script>
+    function csrfToken() {
+      const meta = document.querySelector('meta[name="hermes-csrf-token"]');
+      return meta ? meta.getAttribute("content") || "" : "";
+    }
+
+    // The token is per server process, so it changes after a package restart.
+    // Pick up the fresh one from the wizard page instead of failing the save.
+    async function refreshCsrfToken() {
+      const resp = await fetch("/", { cache: "no-store" });
+      const doc = new DOMParser().parseFromString(await resp.text(), "text/html");
+      const fresh = doc.querySelector('meta[name="hermes-csrf-token"]');
+      const meta = document.querySelector('meta[name="hermes-csrf-token"]');
+      if (fresh && meta) meta.setAttribute("content", fresh.getAttribute("content") || "");
+    }
+
+    async function apiPost(path, body, retry = true) {
+      const resp = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken() },
+        body: JSON.stringify(body || {}),
+      });
+      if (resp.status === 403 && retry) {
+        const data = await resp.clone().json().catch(() => ({}));
+        if (data.code === "csrf") {
+          await refreshCsrfToken();
+          return apiPost(path, body, false);
+        }
+      }
+      return resp;
+    }
+
     // =========================================================================
     // Tab navigation
     // =========================================================================
@@ -1417,11 +1449,7 @@
         }
 
         showNexusAuthResult("ok", "Creating Nexus API key...");
-        const resp = await fetch("/api/nexus/auth/result", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id: resultId }),
-        });
+        const resp = await apiPost("/api/nexus/auth/result", { id: resultId });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(data.error || "Could not retrieve the generated Nexus API key");
 
@@ -1653,15 +1681,11 @@
         dashboardAuthChanged()
       );
       try {
-        const resp = await fetch("/api/config", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ env, configYaml: buildConfigYaml() })
-        });
+        const resp = await apiPost("/api/config", { env, configYaml: buildConfigYaml() });
         if (resp.ok) {
           goTo(4);
           if (needsRestart) {
-            setTimeout(() => fetch("/api/restart", { method: "POST" }).catch(() => { }), 500);
+            setTimeout(() => apiPost("/api/restart", {}).catch(() => { }), 500);
           }
         } else {
           const data = await resp.json();
