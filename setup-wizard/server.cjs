@@ -222,6 +222,60 @@ async function createNexusApiKey(accessToken) {
   return data.raw_key;
 }
 
+// HERMES_HOME is writable by the unprivileged hermes user while this server
+// runs as root, so never follow a symlink (or block on a FIFO) planted there.
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+const O_NONBLOCK = fs.constants.O_NONBLOCK || 0;
+
+function readRegularFile(filePath) {
+  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`${path.basename(filePath)} is not a regular file`);
+    return fs.readFileSync(fd, "utf-8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Atomically replace filePath without following symlinks: refuse if the
+ * target exists and is not a regular file, write a fresh O_EXCL|O_NOFOLLOW
+ * temp file in the same directory, fchmod/fchown it and rename it over the
+ * target. When running as root the file is owned by the directory's owner
+ * (the hermes user), matching what the hermes-run cont-init hooks expect.
+ */
+function writeFileSafely(filePath, content, mode) {
+  const dir = path.dirname(filePath);
+  let existing = null;
+  try {
+    existing = fs.lstatSync(filePath);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  if (existing && !existing.isFile()) {
+    throw new Error(`Refusing to write ${path.basename(filePath)}: not a regular file`);
+  }
+
+  const owner = fs.statSync(dir);
+  const tmpPath = path.join(dir, `.${path.basename(filePath)}.${crypto.randomBytes(8).toString("hex")}.tmp`);
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW;
+  const fd = fs.openSync(tmpPath, flags, 0o600);
+  try {
+    try {
+      fs.writeFileSync(fd, content, "utf-8");
+      if (process.getuid && process.getuid() === 0) fs.fchownSync(fd, owner.uid, owner.gid);
+      fs.fchmodSync(fd, mode);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmpPath); } catch {}
+    throw err;
+  }
+}
+
 function parseEnvLine(line) {
   let trimmed = line.trim();
   if (!trimmed || trimmed.startsWith("#")) return [null, null];
@@ -255,7 +309,7 @@ function serializeEnv(env) {
   const envFile = getEnvFile();
   let lines = [];
   try {
-    const existing = fs.readFileSync(envFile, "utf-8");
+    const existing = readRegularFile(envFile);
     const existingLines = existing.split("\n");
     const written = new Set();
     for (const line of existingLines) {
@@ -277,12 +331,12 @@ function serializeEnv(env) {
 }
 
 function readConfig() {
-  try { return { raw: fs.readFileSync(getConfigFile(), "utf-8") }; }
+  try { return { raw: readRegularFile(getConfigFile()) }; }
   catch { return { raw: "" }; }
 }
 
 function readEnv() {
-  try { return parseEnvFile(fs.readFileSync(getEnvFile(), "utf-8")); }
+  try { return parseEnvFile(readRegularFile(getEnvFile())); }
   catch { return {}; }
 }
 
@@ -300,7 +354,7 @@ function readDashboardCredentials() {
 
   try {
     const values = {};
-    const content = fs.readFileSync(getDashboardLoginFile(), "utf-8");
+    const content = readRegularFile(getDashboardLoginFile());
     for (const line of content.split("\n")) {
       const colon = line.indexOf(":");
       if (colon < 1) continue;
@@ -719,13 +773,11 @@ function handleRequest(req, res) {
           }
           const merged = Object.assign(currentEnv, incoming.env);
           fs.mkdirSync(hermesHome, { recursive: true });
-          fs.writeFileSync(envFile, serializeEnv(merged), { encoding: "utf-8", mode: 0o600 });
-          try { fs.chmodSync(envFile, 0o600); } catch {}
+          writeFileSafely(envFile, serializeEnv(merged), 0o600);
         }
         if (incoming.configYaml && typeof incoming.configYaml === "string") {
           fs.mkdirSync(hermesHome, { recursive: true });
-          fs.writeFileSync(configFile, incoming.configYaml, { encoding: "utf-8", mode: 0o644 });
-          try { fs.chmodSync(configFile, 0o644); } catch {}
+          writeFileSafely(configFile, incoming.configYaml, 0o644);
         }
         json(res, 200, { ok: true });
       })
@@ -801,6 +853,7 @@ module.exports = {
   parseEnvLine,
   parseEnvFile,
   serializeEnv,
+  writeFileSafely,
   readConfig,
   readEnv,
   readDashboardCredentials,

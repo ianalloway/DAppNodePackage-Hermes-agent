@@ -92,6 +92,83 @@ test("serializeEnv preserves comments and updates keys", () => {
   }
 });
 
+function withTempHermesHome(fn) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-symlink-test-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-outside-"));
+  const origHome = process.env.HERMES_HOME;
+  process.env.HERMES_HOME = tmpDir;
+  try {
+    fn(tmpDir, outside);
+  } finally {
+    process.env.HERMES_HOME = origHome;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+}
+
+test("writeFileSafely refuses to write through a symlinked target", () => {
+  withTempHermesHome((home, outside) => {
+    const victim = path.join(outside, "victim");
+    fs.writeFileSync(victim, "root-owned original\n", { mode: 0o644 });
+    const target = path.join(home, ".env");
+    fs.symlinkSync(victim, target);
+
+    assert.throws(() => serverMod.writeFileSafely(target, "PWNED=1\n", 0o600), /not a regular file/);
+    assert.equal(fs.readFileSync(victim, "utf-8"), "root-owned original\n");
+    assert.equal(fs.statSync(victim).mode & 0o777, 0o644);
+    assert.ok(fs.lstatSync(target).isSymbolicLink());
+    assert.deepEqual(fs.readdirSync(home), [".env"]);
+  });
+});
+
+test("writeFileSafely refuses directories and FIFOs", () => {
+  withTempHermesHome((home) => {
+    const dirTarget = path.join(home, "config.yaml");
+    fs.mkdirSync(dirTarget);
+    assert.throws(() => serverMod.writeFileSafely(dirTarget, "x", 0o644), /not a regular file/);
+
+    if (process.platform !== "win32") {
+      const fifo = path.join(home, ".env");
+      require("node:child_process").execFileSync("mkfifo", [fifo]);
+      assert.throws(() => serverMod.writeFileSafely(fifo, "x", 0o600), /not a regular file/);
+      assert.deepEqual(serverMod.readEnv(), {});
+    }
+  });
+});
+
+test("writeFileSafely atomically replaces a regular file with the requested mode", () => {
+  withTempHermesHome((home) => {
+    const target = path.join(home, ".env");
+    fs.writeFileSync(target, "OLD=1\n", { mode: 0o666 });
+    const before = fs.statSync(target).ino;
+
+    serverMod.writeFileSafely(target, "NEW=2\n", 0o600);
+
+    const st = fs.lstatSync(target);
+    assert.ok(st.isFile());
+    assert.notEqual(st.ino, before);
+    assert.equal(st.mode & 0o777, 0o600);
+    assert.equal(st.uid, fs.statSync(home).uid);
+    assert.equal(fs.readFileSync(target, "utf-8"), "NEW=2\n");
+    assert.deepEqual(fs.readdirSync(home), [".env"]);
+  });
+});
+
+test("config and env readers do not follow symlinks out of HERMES_HOME", () => {
+  withTempHermesHome((home, outside) => {
+    const secret = path.join(outside, "secret");
+    fs.writeFileSync(secret, "ROOT_SECRET=leaked\n");
+    fs.symlinkSync(secret, path.join(home, ".env"));
+    fs.symlinkSync(secret, path.join(home, "config.yaml"));
+    fs.symlinkSync(secret, path.join(home, "dashboard-login.txt"));
+
+    assert.deepEqual(serverMod.readEnv(), {});
+    assert.equal(serverMod.readConfig().raw, "");
+    assert.equal(serverMod.readDashboardCredentials().available, false);
+    assert.doesNotMatch(serverMod.serializeEnv({ A: "1" }), /ROOT_SECRET/);
+  });
+});
+
 test("HTTP Server endpoints handle requests", async (t) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-test-"));
   process.env.HERMES_HOME = tmpDir;
@@ -249,6 +326,26 @@ test("HTTP Server endpoints handle requests", async (t) => {
     assert.match(savedEnv, /OPENROUTER_API_KEY=sk-or-test-key-12345/);
     const savedConfig = fs.readFileSync(path.join(tmpDir, "config.yaml"), "utf-8");
     assert.match(savedConfig, /claude-3.7-sonnet/);
+  });
+
+  await t.test("POST /api/config does not write through a symlinked config.yaml", async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-outside-"));
+    const victim = path.join(outside, "victim");
+    fs.writeFileSync(victim, "original\n");
+    fs.rmSync(path.join(tmpDir, "config.yaml"));
+    fs.symlinkSync(victim, path.join(tmpDir, "config.yaml"));
+    try {
+      const res = await fetch(`${baseUrl}/api/config`, {
+        method: "POST",
+        headers: postHeaders(),
+        body: JSON.stringify({ configYaml: "overwritten: true\n" }),
+      });
+      assert.equal(res.status, 400);
+      assert.equal(fs.readFileSync(victim, "utf-8"), "original\n");
+    } finally {
+      fs.rmSync(path.join(tmpDir, "config.yaml"));
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
   });
 
   await t.test("GET /api/doctor returns status", async () => {
