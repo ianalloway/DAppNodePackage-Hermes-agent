@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -76,8 +77,19 @@ def read_dashboard_password(dashboard_login_path: Path, username: str) -> str | 
     return None
 
 
+def write_private_file(path: Path, text: str) -> None:
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(text)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 def write_dashboard_password(dashboard_login_path: Path, username: str, password: str) -> None:
-    dashboard_login_path.write_text(
+    write_private_file(
+        dashboard_login_path,
         "\n".join(
             [
                 "Hermes dashboard login",
@@ -87,12 +99,7 @@ def write_dashboard_password(dashboard_login_path: Path, username: str, password
                 "",
             ]
         ),
-        encoding="utf-8",
     )
-    try:
-        dashboard_login_path.chmod(0o600)
-    except OSError:
-        pass
 
 
 def has_whatsapp_creds(profile_home: Path) -> bool:
@@ -170,13 +177,17 @@ def patch_config(hermes_home: Path, skip_dashboard_auth: bool = False) -> dict:
 
     try:
         with open(config_path) as f:
-            config = yaml.safe_load(f) or {}
+            config = yaml.safe_load(f)
     except FileNotFoundError:
         # Nothing to patch — upstream seeding should have created it, but don't
         # fail the boot if it hasn't.
         return {}
-    except Exception:
+    except yaml.YAMLError:
+        raise ValueError("Malformed config.yaml; repair the existing file before patching it.") from None
+    if config is None:
         config = {}
+    if not isinstance(config, dict):
+        raise ValueError("config.yaml must contain a mapping.")
 
     # --- Network access: bind the gateway to the LAN on the DAppNode port ---
     gw = config.setdefault("gateway", {})
@@ -206,17 +217,8 @@ def patch_config(hermes_home: Path, skip_dashboard_auth: bool = False) -> dict:
             if isinstance(extra, dict) and extra.get("bridge_port") in (None, 3000, "3000"):
                 extra["bridge_port"] = 3010
 
-    with open(config_path, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-
-    dashboard_auth_status = "skipped" if skip_dashboard_auth else "basic"
-    msg = f"Patched config.yaml for DAppNode (api_port=3000, dashboard_auth={dashboard_auth_status}, whatsapp_bridge_port=3010)"
-    if generated_dashboard_auth:
-        msg += f"; dashboard credentials saved to {dashboard_login_path}"
-    print(msg)
-
     # --- Nexus context length: source the real value from /v1/models ---
-    model_section = config.setdefault("model", {})
+    model_section = config.get("model", {})
     provider = model_section.get("provider", "")
     base_url = str(model_section.get("base_url", ""))
     model_id = model_section.get("default") or model_section.get("model") or ""
@@ -225,14 +227,18 @@ def patch_config(hermes_home: Path, skip_dashboard_auth: bool = False) -> dict:
         ctx = fetch_nexus_context_size(base_url, model_id)
         if ctx and model_section.get("context_length") != ctx:
             model_section["context_length"] = ctx
-            with open(config_path, "w") as f:
-                yaml.dump(config, f, default_flow_style=False, sort_keys=False)
             print(f"Nexus: set model.context_length={ctx} for '{model_id}' (from /v1/models)")
         elif ctx:
             print(f"Nexus: model.context_length already {ctx} for '{model_id}', leaving as-is")
         else:
             print(f"Nexus: could not resolve context_size for '{model_id}'; using Hermes default")
 
+    write_private_file(config_path, yaml.safe_dump(config, default_flow_style=False, sort_keys=False))
+    dashboard_auth_status = "skipped" if skip_dashboard_auth else "basic"
+    msg = f"Patched config.yaml for DAppNode (api_port=3000, dashboard_auth={dashboard_auth_status}, whatsapp_bridge_port=3010)"
+    if generated_dashboard_auth:
+        msg += f"; dashboard credentials saved to {dashboard_login_path}"
+    print(msg)
     return config
 
 

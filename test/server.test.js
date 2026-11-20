@@ -9,6 +9,26 @@ const http = require("node:http");
 
 const serverMod = require("../setup-wizard/server.cjs");
 
+test("wizard settings return display fields and token-presence flags", () => {
+  const settings = serverMod.getWizardSettings(
+    "model: {default: sample/model, provider: custom}\ndashboard: {basic_auth: {username: jane}}\n",
+    { TELEGRAM_BOT_TOKEN: "fixture", TELEGRAM_ALLOWED_USERS: "123", UNUSED: "fixture" }
+  );
+  assert.deepEqual(settings, {
+    model: "sample/model", provider: "custom", dashboardUsername: "jane",
+    telegramConfigured: true, discordConfigured: false, slackBotConfigured: false,
+    slackAppConfigured: false, telegramUsers: "123", discordUsers: "", discordChannels: "",
+  });
+});
+
+test("wizard settings fall back to environment display fields on invalid YAML", () => {
+  const settings = serverMod.getWizardSettings("model: [unfinished", { LLM_MODEL: "local-model" });
+  assert.equal(settings.model, "local-model");
+  assert.equal(settings.provider, "custom");
+  assert.equal(settings.dashboardUsername, "dappnode");
+  assert.equal(settings.telegramConfigured, false);
+});
+
 test("parseEnvFile parses key-value lines correctly", () => {
   const input = `
 # Comment
@@ -378,12 +398,15 @@ test("HTTP Server endpoints handle requests", async (t) => {
     assert.match(fs.readFileSync(configPath, "utf-8"), /same-origin\/model/);
   });
 
-  await t.test("GET /api/config returns default config and env", async () => {
+  await t.test("GET /api/config returns wizard settings", async () => {
     const res = await fetch(`${baseUrl}/api/config`);
     assert.equal(res.status, 200);
+    assert.equal(res.headers.get("cache-control"), "no-store");
     const data = await res.json();
-    assert.ok(typeof data.config === "string");
-    assert.ok(typeof data.env === "object");
+    assert.equal(typeof data.model, "string");
+    assert.equal(typeof data.telegramConfigured, "boolean");
+    assert.equal(Object.hasOwn(data, "config"), false);
+    assert.equal(Object.hasOwn(data, "env"), false);
   });
 
   await t.test("POST /api/config writes config and env files", async () => {
@@ -402,6 +425,7 @@ test("HTTP Server endpoints handle requests", async (t) => {
     const savedEnv = fs.readFileSync(path.join(tmpDir, ".env"), "utf-8");
     assert.match(savedEnv, /OPENROUTER_API_KEY=sk-or-test-key-12345/);
     const savedConfig = fs.readFileSync(path.join(tmpDir, "config.yaml"), "utf-8");
+    assert.equal(fs.statSync(path.join(tmpDir, "config.yaml")).mode & 0o777, 0o600);
     assert.match(savedConfig, /claude-3.7-sonnet/);
   });
 
