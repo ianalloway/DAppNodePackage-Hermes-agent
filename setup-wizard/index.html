@@ -785,7 +785,7 @@
           <div class="field">
             <label>Telegram Bot Token <span class="optional-badge">optional</span></label>
             <div class="hint">From <strong>@BotFather</strong> on Telegram.</div>
-            <input type="text" id="telegram-token" placeholder="123456789:ABCdefGHIjklMNO...">
+            <input type="password" id="telegram-token" autocomplete="new-password" placeholder="123456789:ABCdefGHIjklMNO...">
           </div>
           <div class="field" id="telegram-users-field" style="display:none; margin-bottom:0">
             <label>Allowed Telegram User IDs <span class="optional-badge">optional</span></label>
@@ -969,43 +969,29 @@
     // =========================================================================
     let _dashboardPollTimer = null;
 
-    function dashboardUsernameFromConfig(raw, env) {
-      const fromEnv = (env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME || "").trim();
-      if (fromEnv) return fromEnv;
-      const match = String(raw || "").match(/basic_auth:\s*[\s\S]*?username:\s*["']?([^"'\n]+)/);
-      return match ? match[1].trim() : "dappnode";
-    }
-
-    function hydrateDashboardAuthFields(raw, env) {
-      existingEnv = env || {};
-      existingDashboardUsername = dashboardUsernameFromConfig(raw, existingEnv);
+    function hydrateDashboardAuthFields(settings) {
+      existingSettings = settings;
+      existingDashboardUsername = settings.dashboardUsername;
       const usernameEl = document.getElementById("dashboard-username");
-      if (usernameEl && !dashboardUsernameTouched) {
-        usernameEl.value = existingDashboardUsername;
+      if (!dashboardUsernameTouched) usernameEl.value = existingDashboardUsername;
+
+      for (const [id, configured] of [
+        ["telegram-token", settings.telegramConfigured],
+        ["discord-token", settings.discordConfigured],
+        ["slack-bot-token", settings.slackBotConfigured],
+        ["slack-app-token", settings.slackAppConfigured],
+      ]) {
+        if (configured) document.getElementById(id).placeholder = "Configured — enter a new token to replace it";
       }
-      if (existingEnv.TELEGRAM_BOT_TOKEN) {
-        const tg = document.getElementById("telegram-token");
-        if (tg && !tg.value) tg.value = existingEnv.TELEGRAM_BOT_TOKEN;
-        const tgUsers = document.getElementById("telegram-users");
-        if (tgUsers && existingEnv.TELEGRAM_ALLOWED_USERS && !tgUsers.value) {
-          tgUsers.value = existingEnv.TELEGRAM_ALLOWED_USERS;
-          document.getElementById("telegram-users-field").style.display = "block";
-        }
+      for (const [id, value] of [
+        ["telegram-users", settings.telegramUsers],
+        ["discord-users", settings.discordUsers],
+        ["discord-channels", settings.discordChannels],
+      ]) {
+        const input = document.getElementById(id);
+        if (value && !input.value) input.value = value;
       }
-      if (existingEnv.DISCORD_BOT_TOKEN) {
-        const dToken = document.getElementById("discord-token");
-        if (dToken && !dToken.value) dToken.value = existingEnv.DISCORD_BOT_TOKEN;
-        const dUsers = document.getElementById("discord-users");
-        if (dUsers && existingEnv.DISCORD_ALLOWED_USERS && !dUsers.value) dUsers.value = existingEnv.DISCORD_ALLOWED_USERS;
-        const dChan = document.getElementById("discord-channels");
-        if (dChan && existingEnv.DISCORD_ALLOWED_CHANNELS && !dChan.value) dChan.value = existingEnv.DISCORD_ALLOWED_CHANNELS;
-      }
-      if (existingEnv.SLACK_BOT_TOKEN) {
-        const sBot = document.getElementById("slack-bot-token");
-        if (sBot && !sBot.value) sBot.value = existingEnv.SLACK_BOT_TOKEN;
-        const sApp = document.getElementById("slack-app-token");
-        if (sApp && existingEnv.SLACK_APP_TOKEN && !sApp.value) sApp.value = existingEnv.SLACK_APP_TOKEN;
-      }
+      if (settings.telegramConfigured) document.getElementById("telegram-users-field").style.display = "block";
     }
 
     async function refreshDashboard() {
@@ -1034,13 +1020,10 @@
       try {
         const resp = await fetch("/api/config");
         const data = await resp.json();
-        const env = data.env || {};
-        const raw = data.config || "";
-        hydrateDashboardAuthFields(raw, env);
-        const provMatch = raw.match(/provider:\s*["']?([^"'\n]+)/);
-        const modelMatch = raw.match(/default:\s*["']?([^"'\n]+)/);
-        document.getElementById("st-provider").textContent = provMatch ? provMatch[1].trim() : (env.LLM_MODEL ? "custom" : "—");
-        document.getElementById("st-model").textContent = modelMatch ? modelMatch[1].trim() : (env.LLM_MODEL || "—");
+        if (!resp.ok) return;
+        hydrateDashboardAuthFields(data);
+        document.getElementById("st-provider").textContent = data.provider || "—";
+        document.getElementById("st-model").textContent = data.model || "—";
       } catch { }
     }
     refreshDashboard();
@@ -1106,7 +1089,7 @@
     let selectedProvider = null;
     let openRouterModels = [];
     let nexusModels = [];
-    let existingEnv = {};
+    let existingSettings = {};
     let existingDashboardUsername = "";
     let dashboardUsernameTouched = false;
 
@@ -1134,7 +1117,7 @@
     }
 
     document.getElementById("telegram-token").addEventListener("input", (e) => {
-      document.getElementById("telegram-users-field").style.display = e.target.value.trim() ? "block" : "none";
+      document.getElementById("telegram-users-field").style.display = (e.target.value.trim() || existingSettings.telegramConfigured) ? "block" : "none";
     });
     document.getElementById("dashboard-username").addEventListener("input", () => {
       dashboardUsernameTouched = true;
@@ -1559,8 +1542,8 @@
       }
 
       const tgToken = (document.getElementById("telegram-token").value || "").trim();
-      if (tgToken) {
-        env.TELEGRAM_BOT_TOKEN = tgToken;
+      if (tgToken) env.TELEGRAM_BOT_TOKEN = tgToken;
+      if (tgToken || existingSettings.telegramConfigured) {
         const tgUsers = (document.getElementById("telegram-users").value || "").trim();
         if (tgUsers) env.TELEGRAM_ALLOWED_USERS = tgUsers;
       }
@@ -1569,16 +1552,16 @@
         if (waUsers) env.WHATSAPP_ALLOWED_USERS = waUsers;
       }
       const discordToken = (document.getElementById("discord-token").value || "").trim();
-      if (discordToken) {
-        env.DISCORD_BOT_TOKEN = discordToken;
+      if (discordToken) env.DISCORD_BOT_TOKEN = discordToken;
+      if (discordToken || existingSettings.discordConfigured) {
         const dUsers = (document.getElementById("discord-users").value || "").trim();
         if (dUsers) env.DISCORD_ALLOWED_USERS = dUsers;
         const dChannels = (document.getElementById("discord-channels").value || "").trim();
         if (dChannels) env.DISCORD_ALLOWED_CHANNELS = dChannels;
       }
       const slackBot = (document.getElementById("slack-bot-token").value || "").trim();
-      if (slackBot) {
-        env.SLACK_BOT_TOKEN = slackBot;
+      if (slackBot) env.SLACK_BOT_TOKEN = slackBot;
+      if (slackBot || existingSettings.slackBotConfigured) {
         const slackApp = (document.getElementById("slack-app-token").value || "").trim();
         if (slackApp) env.SLACK_APP_TOKEN = slackApp;
       }
@@ -1677,7 +1660,10 @@
         env.TELEGRAM_BOT_TOKEN ||
         env.WHATSAPP_ENABLED ||
         env.DISCORD_BOT_TOKEN ||
-        env.SLACK_BOT_TOKEN ||
+        env.SLACK_BOT_TOKEN || env.SLACK_APP_TOKEN ||
+        (env.TELEGRAM_ALLOWED_USERS && env.TELEGRAM_ALLOWED_USERS !== existingSettings.telegramUsers) ||
+        (env.DISCORD_ALLOWED_USERS && env.DISCORD_ALLOWED_USERS !== existingSettings.discordUsers) ||
+        (env.DISCORD_ALLOWED_CHANNELS && env.DISCORD_ALLOWED_CHANNELS !== existingSettings.discordChannels) ||
         dashboardAuthChanged()
       );
       try {

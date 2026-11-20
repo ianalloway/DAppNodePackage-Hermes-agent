@@ -26,6 +26,24 @@ DAppNode package for [Hermes Agent](https://hermes-agent.nousresearch.com/) by [
 
 ## Getting Started
 
+Give only trusted operators network access to the setup wizard and web terminal.
+The wizard changes configuration and opens dashboard sessions. It shows which
+messaging tokens are configured. Leave a token blank to keep its saved value.
+Anyone who can reach these interfaces has operator access.
+
+```mermaid
+sequenceDiagram
+    participant Operator
+    participant Wizard as Setup wizard
+    participant Storage as Hermes data directory
+    Operator->>Wizard: Open the setup page
+    Wizard->>Storage: Read settings and check saved token presence
+    Wizard-->>Operator: Display model, username and configured integrations
+    Operator->>Wizard: Save edited settings
+    Wizard->>Storage: Merge submitted environment fields and replace configuration files
+    Wizard-->>Operator: Confirm save
+```
+
 1. Install the package from the DAppNode Package Store.
 2. Open the **Setup Wizard** at `http://hermes-agent.dappnode:8080` to configure your AI provider and integrations.
 3. Open the **Hermes Dashboard** at `http://hermes-agent.dappnode:8080/dashboard` or run `hermes chat` in the **Web Terminal**.
@@ -35,6 +53,11 @@ DAppNode package for [Hermes Agent](https://hermes-agent.nousresearch.com/) by [
 Run unit tests for both Node.js and Python hooks:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install PyYAML
+npm ci
+
 # Run all tests
 npm test
 

@@ -98,6 +98,25 @@ class TestPatchConfig(unittest.TestCase):
         patched = patch_config_mod.patch_config(self.hermes_home / "nonexistent")
         self.assertEqual(patched, {})
 
+    def test_invalid_existing_config_is_preserved(self):
+        config = self.hermes_home / "config.yaml"
+        for invalid in ("model: [unfinished", "[]\n", "false\n"):
+            with self.subTest(invalid=invalid):
+                config.write_text(invalid)
+                with self.assertRaises((yaml.YAMLError, ValueError)):
+                    patch_config_mod.patch_config(self.hermes_home)
+                self.assertEqual(config.read_text(), invalid)
+                self.assertFalse((self.hermes_home / "dashboard-login.txt").exists())
+
+    def test_patch_preserves_settings_and_protects_credential_files(self):
+        config = self.hermes_home / "config.yaml"
+        config.write_text("custom_setting: retained\n")
+        config.chmod(0o644)
+        patch_config_mod.patch_config(self.hermes_home)
+        self.assertEqual(yaml.safe_load(config.read_text())["custom_setting"], "retained")
+        self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.hermes_home / "dashboard-login.txt").stat().st_mode & 0o777, 0o600)
+
 
 if __name__ == "__main__":
     unittest.main()

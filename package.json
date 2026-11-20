@@ -16,5 +16,8 @@
     "llm"
   ],
   "author": "DAppNode Association <admin@dappnode.io>",
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "yaml": "2.9.1"
+  }
 }

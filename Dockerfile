@@ -11,6 +11,8 @@ ADD --chmod=755 https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86
 RUN cd /opt/hermes/scripts/whatsapp-bridge && npm install --omit=dev --no-audit --no-fund
 
 # Copy setup wizard into the image
+COPY package.json package-lock.json /opt/setup-wizard/
+RUN npm ci --prefix /opt/setup-wizard --omit=dev --ignore-scripts --no-audit --no-fund
 COPY setup-wizard/ /opt/setup-wizard/
 
 # Copy DAppNode context files (seeded into HERMES_HOME on first boot)

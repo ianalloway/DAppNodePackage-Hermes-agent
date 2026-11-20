@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const net = require("node:net");
+const YAML = require("yaml");
 const { execFile } = require("node:child_process");
 
 const PORT = Number(process.env.PORT || 8080);
@@ -373,6 +374,28 @@ function readConfig() {
 function readEnv() {
   try { return parseEnvFile(readRegularFile(getEnvFile())); }
   catch { return {}; }
+}
+
+function getWizardSettings(rawConfig, env) {
+  let config;
+  try {
+    config = YAML.parse(rawConfig);
+  } catch {
+    // A broken config can still be repaired in the wizard.
+  }
+  const string = (value) => typeof value === "string" ? value : "";
+  return {
+    model: string(config?.model?.default) || env.LLM_MODEL || "",
+    provider: string(config?.model?.provider) || (env.LLM_MODEL ? "custom" : ""),
+    dashboardUsername: env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME || string(config?.dashboard?.basic_auth?.username) || "dappnode",
+    telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN),
+    discordConfigured: Boolean(env.DISCORD_BOT_TOKEN),
+    slackBotConfigured: Boolean(env.SLACK_BOT_TOKEN),
+    slackAppConfigured: Boolean(env.SLACK_APP_TOKEN),
+    telegramUsers: env.TELEGRAM_ALLOWED_USERS || "",
+    discordUsers: env.DISCORD_ALLOWED_USERS || "",
+    discordChannels: env.DISCORD_ALLOWED_CHANNELS || "",
+  };
 }
 
 function readDashboardCredentials() {
@@ -788,9 +811,8 @@ function handleRequest(req, res) {
 
   // Read existing config + env
   if (req.method === "GET" && url.pathname === "/api/config") {
-    const config = readConfig();
-    const env = readEnv();
-    json(res, 200, { config: config.raw, env });
+    res.setHeader("Cache-Control", "no-store");
+    json(res, 200, getWizardSettings(readConfig().raw, readEnv()));
     return;
   }
 
@@ -818,7 +840,7 @@ function handleRequest(req, res) {
         }
         if (incoming.configYaml && typeof incoming.configYaml === "string") {
           fs.mkdirSync(hermesHome, { recursive: true });
-          writeFileSafely(configFile, incoming.configYaml, 0o644);
+          writeFileSafely(configFile, incoming.configYaml, 0o600);
         }
         json(res, 200, { ok: true });
       })
@@ -898,6 +920,7 @@ module.exports = {
   writeFileSafely,
   readConfig,
   readEnv,
+  getWizardSettings,
   readDashboardCredentials,
   sanitizeReturnTo,
   withReturnParams,
