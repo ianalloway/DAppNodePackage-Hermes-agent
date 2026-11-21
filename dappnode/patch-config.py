@@ -17,6 +17,9 @@ from pathlib import Path
 import yaml
 
 
+NEXUS_BASE_URL = "https://nexus-api.dappnode.com/v1"
+
+
 def parse_env_line(line: str) -> tuple[str | None, str | None]:
     stripped = line.strip()
     if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -44,13 +47,13 @@ def read_env(path: Path) -> dict[str, str]:
     return env
 
 
-def fetch_nexus_context_size(base_url: str, model_id: str) -> int | None:
+def fetch_nexus_context_size(model_id: str) -> int | None:
     """Return the context_size Nexus reports for model_id, or None.
 
-    Queries the OpenAI-compatible ``{base_url}/models`` listing, which Nexus
+    Queries the OpenAI-compatible models listing, which Nexus
     serves publicly with a ``context_size`` field per model.
     """
-    url = base_url.rstrip("/") + "/models"
+    url = f"{NEXUS_BASE_URL}/models"
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -223,8 +226,8 @@ def patch_config(hermes_home: Path, skip_dashboard_auth: bool = False) -> dict:
     base_url = str(model_section.get("base_url", ""))
     model_id = model_section.get("default") or model_section.get("model") or ""
 
-    if provider == "custom" and "nexus-api.dappnode.com" in base_url and model_id:
-        ctx = fetch_nexus_context_size(base_url, model_id)
+    if provider == "custom" and base_url.rstrip("/") == NEXUS_BASE_URL and model_id:
+        ctx = fetch_nexus_context_size(model_id)
         if ctx and model_section.get("context_length") != ctx:
             model_section["context_length"] = ctx
             print(f"Nexus: set model.context_length={ctx} for '{model_id}' (from /v1/models)")
