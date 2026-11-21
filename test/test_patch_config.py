@@ -3,6 +3,7 @@
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import yaml
@@ -22,6 +23,27 @@ class TestPatchConfig(unittest.TestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    def test_context_size_only_uses_the_configured_nexus_endpoint(self):
+        config = self.hermes_home / "config.yaml"
+        for base_url, expected in (
+            (patch_config_mod.NEXUS_BASE_URL, True),
+            (patch_config_mod.NEXUS_BASE_URL + "/", True),
+            (patch_config_mod.NEXUS_BASE_URL + "/custom-route", False),
+            ("https://custom.example/v1", False),
+        ):
+            with self.subTest(base_url=base_url):
+                model = {"provider": "custom", "base_url": base_url, "default": "example"}
+                config.write_text(yaml.safe_dump({"model": model}))
+                with patch.object(patch_config_mod, "fetch_nexus_context_size", return_value=4096) as lookup:
+                    result = patch_config_mod.patch_config(self.hermes_home, skip_dashboard_auth=True)
+                self.assertEqual(result["model"]["base_url"], base_url)
+                if expected:
+                    lookup.assert_called_once_with("example")
+                    self.assertEqual(result["model"]["context_length"], 4096)
+                else:
+                    lookup.assert_not_called()
+                    self.assertNotIn("context_length", result["model"])
 
     def test_parse_env_line(self):
         self.assertEqual(patch_config_mod.parse_env_line("FOO=bar"), ("FOO", "bar"))
